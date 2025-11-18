@@ -149,9 +149,15 @@ if (!is_array($input) || !isset($input['phones']) || !is_array($input['phones'])
     http_response_code(400);
     echo json_encode([
         'success' => false,
-        'error'   => 'Send JSON body: { "phones": ["+2519...", "09...", "9..."] }',
+        'error'   => 'Send JSON body: { "phones": ["+2519...", "09...", "9..."], "names": ["Name A", "Name B", ...] }',
     ]);
     exit;
+}
+
+// Optional parallel names array (same indexes as phones[])
+$inputNames = [];
+if (isset($input['names']) && is_array($input['names'])) {
+    $inputNames = $input['names'];
 }
 
 // ---- Check contact count and clear if needed ----
@@ -180,7 +186,8 @@ try {
 
 $result = [];
 
-// We keep order; no dedupe here
+// We keep order; no dedupe here so names[] stays aligned.
+// You can dedupe on the caller side if you want.
 $phones = array_values(array_map('strval', $input['phones']));
 
 foreach ($phones as $idx => $rawPhone) {
@@ -193,37 +200,44 @@ foreach ($phones as $idx => $rawPhone) {
     $canonical = et_format_for_tg($rawPhone);
     if ($canonical === null) {
         $result[] = [
-            'phone'        => $rawPhone,
-            'canonical'    => null,
-            'user'         => null,
-            'photos'       => [],
-            'name_from_tg' => null,
-            'error'        => 'Cannot normalize phone to +2519xxxxxxxx',
+            'phone'   => $rawPhone,
+            'user'    => null,
+            'photos'  => [],
+            'error'   => 'Cannot normalize phone to +2519xxxxxxxx',
         ];
         continue;
     }
 
     // Digits-only for contact import: e.g. "251910902269"
-    $digits = preg_replace('/\D+/', '', $canonical);
+    $digits     = preg_replace('/\D+/', '', $canonical);
+    $localPhone = substr($digits, -9); // "910902269"
+
+    // Name from caller (BigQuery), if provided
+    $providedName = '';
+    if (array_key_exists($idx, $inputNames) && is_string($inputNames[$idx])) {
+        $providedName = trim($inputNames[$idx]);
+    }
 
     $entry = [
-        'phone'        => $rawPhone,
-        'canonical'    => $canonical,
-        'user'         => null,
-        'photos'       => [],
-        'name_from_tg' => null,
-        'error'        => null,
+        'phone'   => $canonical,
+        'user'    => null,
+        'photos'  => [],
+        'error'   => null,
     ];
 
     try {
-        // Import contact with a temporary name - we'll get the real name from Telegram
+        // Always use provided name if available, otherwise use "Imported"
+        $firstName = $providedName !== '' ? $providedName : 'Imported';
+        $lastName  = '';
+
+        // Import/refresh contact (needed for "My Contacts" photo privacy)
         $importRes = $MadelineProto->contacts->importContacts([
             'contacts' => [
                 [
                     '_'          => 'inputPhoneContact',
-                    'phone'      => $digits,
-                    'first_name' => 'Temp Lookup',
-                    'last_name'  => '',
+                    'phone'      => $digits,   // "2519xxxxxxxx"
+                    'first_name' => $firstName,
+                    'last_name'  => $lastName,
                 ],
             ],
         ]);
@@ -242,24 +256,12 @@ foreach ($phones as $idx => $rawPhone) {
             continue;
         }
 
-        // Extract the real name from Telegram
-        $realFirstName = $userRaw['first_name'] ?? '';
-        $realLastName = $userRaw['last_name'] ?? '';
-        
-        // Combine first and last name
-        $realName = trim($realFirstName . ' ' . $realLastName);
-        if ($realName === '') {
-            $realName = null;
-        }
-
-        $entry['name_from_tg'] = $realName;
-
         // Basic user info (their Telegram profile name etc.)
         $entry['user'] = [
             'id'         => $userRaw['id']         ?? null,
             'username'   => $userRaw['username']   ?? null,
-            'first_name' => $realFirstName,
-            'last_name'  => $realLastName,
+            'first_name' => $userRaw['first_name'] ?? null,
+            'last_name'  => $userRaw['last_name']  ?? null,
             'phone'      => $userRaw['phone']      ?? null,
             'bot'        => $userRaw['bot']        ?? false,
         ];
