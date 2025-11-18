@@ -2,7 +2,8 @@
 declare(strict_types=1);
 
 use danog\MadelineProto\API;
-use danog\MadelineProto\Settings\App as AppSettings;
+use danog\MadelineProto\Settings;
+use danog\MadelineProto\Settings\AppInfo;
 
 require __DIR__ . '/vendor/autoload.php';
 
@@ -47,9 +48,19 @@ try {
     }
 
     // 4) Create MadelineProto API instance (no preload logic)
-    $settings = new AppSettings();
-    $settings->setApiId((int) getenv('API_ID'));
-    $settings->setApiHash((string) getenv('API_HASH'));
+    $settings = new Settings();
+    $appInfo  = $settings->getAppInfo();
+
+    $apiId   = getenv('API_ID');
+    $apiHash = getenv('API_HASH');
+
+    if (!$apiId || !$apiHash) {
+        throw new RuntimeException('API_ID or API_HASH env variables are not set in Railway.');
+    }
+
+    $appInfo->setApiId((int)$apiId);
+    $appInfo->setApiHash((string)$apiHash);
+    $settings->setAppInfo($appInfo);
 
     $MadelineProto = new API($sessionFile, $settings);
     $MadelineProto->start();
@@ -62,7 +73,6 @@ try {
 
         if ($countUsers > 2000) {
             // Delete synced/saved contacts
-            // (Dedicated account only - safe to clear.)
             $MadelineProto->contacts->resetSaved();
         }
     } catch (\Throwable $cleanupEx) {
