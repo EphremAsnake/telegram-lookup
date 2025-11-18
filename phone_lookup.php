@@ -149,9 +149,15 @@ if (!is_array($input) || !isset($input['phones']) || !is_array($input['phones'])
     http_response_code(400);
     echo json_encode([
         'success' => false,
-        'error'   => 'Send JSON body: { "phones": ["+2519...", "09...", "9..."] }',
+        'error'   => 'Send JSON body: { "phones": ["+2519...", "09...", "9..."], "names": ["Name A", "Name B", ...] }',
     ]);
     exit;
+}
+
+// Optional parallel names array (same indexes as phones[])
+$inputNames = [];
+if (isset($input['names']) && is_array($input['names'])) {
+    $inputNames = $input['names'];
 }
 
 // ---- Preload existing contacts (to preserve your contact names when possible) ----
@@ -177,10 +183,11 @@ try {
 
 $result = [];
 
-// Dedupe phones for speed
-$phones = array_values(array_unique(array_map('strval', $input['phones'])));
+// We keep order; no dedupe here so names[] stays aligned.
+// You can dedupe on the caller side if you want.
+$phones = array_values(array_map('strval', $input['phones']));
 
-foreach ($phones as $rawPhone) {
+foreach ($phones as $idx => $rawPhone) {
     $rawPhone = trim($rawPhone);
     if ($rawPhone === '') {
         continue;
@@ -202,6 +209,12 @@ foreach ($phones as $rawPhone) {
     $digits     = preg_replace('/\D+/', '', $canonical);
     $localPhone = substr($digits, -9); // "910902269"
 
+    // Name from caller (BigQuery), if provided
+    $providedName = '';
+    if (array_key_exists($idx, $inputNames) && is_string($inputNames[$idx])) {
+        $providedName = trim($inputNames[$idx]);
+    }
+
     $entry = [
         'phone'   => $canonical,
         'user'    => null,
@@ -210,15 +223,19 @@ foreach ($phones as $rawPhone) {
     ];
 
     try {
-        // Decide name to use when importing (preserve existing name if possible)
+        // Decide name to use when importing (preserve existing contact name if possible,
+        // else use provided BigQuery name, else fallback "Imported").
         $existing = $existingContacts[$digits] ?? null;
 
         $firstName = 'Imported';
         $lastName  = '';
 
-        if ($existing) {
+        if ($existing && trim(($existing['first_name'] ?? '') . ($existing['last_name'] ?? '')) !== '') {
             $firstName = $existing['first_name'] ?: 'Imported';
-            $lastName  = $existing['last_name']  ?: '';
+            $lastName  = $existing['last_name']  ?? '';
+        } elseif ($providedName !== '') {
+            $firstName = $providedName;
+            $lastName  = '';
         }
 
         // Import/refresh contact (needed for "My Contacts" photo privacy)
