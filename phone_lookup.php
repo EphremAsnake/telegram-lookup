@@ -1,45 +1,213 @@
 <?php
-// phone_lookup.php: HTTP API to look up Telegram user + profile photo by phone
 declare(strict_types=1);
+
+use danog\MadelineProto\API;
+use danog\MadelineProto\Settings\App as AppSettings;
+
+require __DIR__ . '/vendor/autoload.php';
 
 header('Content-Type: application/json');
 
-// ---- Load MadelineProto from madeline.php (single-file install) ----
-if (!file_exists(__DIR__ . '/madeline.php')) {
-    copy('https://phar.madelineproto.xyz/madeline.php', __DIR__ . '/madeline.php');
-}
-require __DIR__ . '/madeline.php';
+$response = [
+    'success' => false,
+    'results' => [],
+];
 
-use danog\MadelineProto\API;
-use danog\MadelineProto\Settings;
-use danog\MadelineProto\Logger;
+try {
+    // 1) Basic method guard
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+        throw new RuntimeException('Use POST with JSON body: {"phones": [...], "names": [...]}');
+    }
+
+    // 2) Parse JSON body
+    $rawBody = file_get_contents('php://input');
+    if ($rawBody === false || $rawBody === '') {
+        throw new RuntimeException('Empty request body');
+    }
+
+    $data = json_decode($rawBody, true);
+    if (!is_array($data)) {
+        throw new RuntimeException('Invalid JSON body');
+    }
+
+    $phones = $data['phones'] ?? null;
+    $names  = $data['names']  ?? [];
+
+    if (!is_array($phones) || count($phones) === 0) {
+        throw new RuntimeException('"phones" must be a non-empty array');
+    }
+    if (!is_array($names)) {
+        $names = [];
+    }
+
+    // 3) Ensure telegram session exists
+    $sessionFile = __DIR__ . '/session.madeline';
+    if (!file_exists($sessionFile)) {
+        throw new RuntimeException('Telegram session not initialized. Open /login.php first and log in.');
+    }
+
+    // 4) Create MadelineProto API instance (no preload logic)
+    $settings = new AppSettings();
+    $settings->setApiId((int) getenv('API_ID'));
+    $settings->setApiHash((string) getenv('API_HASH'));
+
+    $MadelineProto = new API($sessionFile, $settings);
+    $MadelineProto->start();
+
+    // 5) Auto-clean contacts if count > 2000 (on dedicated account)
+    try {
+        $contactsObj = $MadelineProto->contacts->getContacts();
+        $userList    = $contactsObj['users'] ?? [];
+        $countUsers  = is_array($userList) ? count($userList) : 0;
+
+        if ($countUsers > 2000) {
+            // Delete synced/saved contacts
+            // (Dedicated account only - safe to clear.)
+            $MadelineProto->contacts->resetSaved();
+        }
+    } catch (\Throwable $cleanupEx) {
+        // Non-fatal; just log to error log and continue
+        error_log('contacts cleanup failed: ' . $cleanupEx->getMessage());
+    }
+
+    // 6) Normalize phones to +2519xxxxxxxx & prepare import payload
+    $importContacts = [];
+    $indexMap       = []; // canonical phone => index(es) in input phones array
+    foreach ($phones as $i => $rawPhone) {
+        $canon = et_format_for_tg((string)$rawPhone);
+        if ($canon === null) {
+            $response['results'][] = [
+                'phone'   => (string)$rawPhone,
+                'user'    => null,
+                'photos'  => [],
+                'error'   => 'Unsupported or invalid phone format for this lookup',
+            ];
+            continue;
+        }
+
+        $name = '';
+        if (array_key_exists($i, $names) && is_string($names[$i])) {
+            $name = trim($names[$i]);
+        }
+        if ($name === '') {
+            $name = 'Imported';
+        }
+
+        $importContacts[] = [
+            '_'         => 'inputPhoneContact',
+            'client_id' => $i + 1,
+            'phone'     => $canon,
+            'first_name'=> $name,
+            'last_name' => '',
+        ];
+
+        $indexMap[$canon][] = $i;
+    }
+
+    if (empty($importContacts)) {
+        throw new RuntimeException('No valid phones to import.');
+    }
+
+    // 7) Import contacts (ephemeral — names from our request)
+    $importResult = $MadelineProto->contacts->importContacts([
+        'contacts' => $importContacts,
+    ]);
+
+    // Map: phone => user (from import result)
+    $usersByPhone = buildUsersByPhone($importResult);
+
+    // 8) For each canonical phone, fetch smallest profile photo and return base64
+    $results = [];
+    foreach ($indexMap as $canonPhone => $indices) {
+        $resTemplate = [
+            'phone'  => $canonPhone,
+            'user'   => null,
+            'photos' => [],
+            'error'  => null,
+        ];
+
+        if (!isset($usersByPhone[$canonPhone])) {
+            $resTemplate['error'] = 'User not found after import';
+            // Apply same result for all indices referring to this phone
+            foreach ($indices as $idx) {
+                $results[$idx] = $resTemplate;
+            }
+            continue;
+        }
+
+        $user = $usersByPhone[$canonPhone];
+
+        $resTemplate['user'] = [
+            'id'         => $user['id'] ?? null,
+            'username'   => $user['username'] ?? null,
+            'first_name' => $user['first_name'] ?? null,
+            'last_name'  => $user['last_name'] ?? null,
+            'phone'      => $user['phone'] ?? null,
+            'bot'        => $user['bot'] ?? false,
+        ];
+
+        // Try to get one small profile photo
+        try {
+            $photoDataUri = getSmallProfilePhotoAsDataUri($MadelineProto, $user);
+            if ($photoDataUri !== null) {
+                $resTemplate['photos'][] = [
+                    'data_uri' => $photoDataUri,
+                    'mime'     => 'image/jpeg',
+                ];
+            }
+        } catch (\Throwable $photoEx) {
+            $resTemplate['error'] = 'Photo fetch error: ' . $photoEx->getMessage();
+        }
+
+        foreach ($indices as $idx) {
+            $results[$idx] = $resTemplate;
+        }
+    }
+
+    // Keep original order by ksort on index
+    ksort($results);
+    $response['results'] = array_values($results);
+    $response['success'] = true;
+
+} catch (\Throwable $e) {
+    $response['success'] = false;
+    $response['error']   = $e->getMessage();
+}
+
+echo json_encode($response, JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT);
+exit;
+
 
 /**
- * Normalize Ethiopian phone to canonical +2519xxxxxxxx
- * Accepts: 9xxxxxxxx, 09xxxxxxxx, 2519xxxxxxxx, +2519xxxxxxxx, etc.
- * Returns null if cannot normalize.
+ * Normalize Ethiopian-style numbers into +2519xxxxxxxx
+ * Supports:
+ *  - 9xxxxxxxx
+ *  - 09xxxxxxxx
+ *  - 2519xxxxxxxxx
+ * Returns null if format is not a mobile number starting with 9.
  */
-function et_format_for_tg(string $raw): ?string {
+function et_format_for_tg(string $raw): ?string
+{
     $digits = preg_replace('/\D+/', '', $raw);
     if ($digits === '') {
         return null;
     }
 
-    // If starts with 0 (0910..., 09xxxxxxxx) -> drop leading 0
+    // If starts with 0 (e.g. 0910..., 09xxxxxxxx) -> drop leading 0
     if ($digits[0] === '0') {
         $digits = substr($digits, 1);
     }
 
-    // If starts with 251 (already has country code)
+    // If starts with 251 (already with country code)
     if (strpos($digits, '251') === 0) {
         if (strlen($digits) >= 12) {
-            // last 9 digits are local mobile
+            // keep last 9 digits
             $digits = substr($digits, -9);
         } else {
             return null;
         }
     } else {
-        // No country code, assume local: take last 9 digits
+        // no country code, assume local: take last 9 digits
         if (strlen($digits) >= 9) {
             $digits = substr($digits, -9);
         } else {
@@ -47,284 +215,99 @@ function et_format_for_tg(string $raw): ?string {
         }
     }
 
-    // For mobile: must start with 9xxxxxxx
+    // For Ethiopian mobile, local part should start with 9 (9xxxxxxxx)
     if ($digits[0] !== '9') {
         return null;
     }
 
-    return '+251' . $digits; // canonical E.164
+    return '+251' . $digits;
 }
 
 /**
- * Resize & recompress JPEG image data (in memory) using GD, return new binary.
- * If GD not available or something fails, original data is returned.
+ * Build map phone => user array from contacts.importContacts result.
  */
-function optimize_image_jpeg(string $data, int $maxSize = 256, int $quality = 80): string
+function buildUsersByPhone(array $importResult): array
 {
-    if (!extension_loaded('gd')) {
-        return $data;
+    $map = [];
+
+    $users = $importResult['users'] ?? [];
+    if (!is_array($users)) {
+        return $map;
     }
 
-    $src = @imagecreatefromstring($data);
-    if (!$src) {
-        return $data;
+    foreach ($users as $u) {
+        if (!isset($u['_']) || $u['_'] !== 'user') {
+            continue;
+        }
+        $phone = $u['phone'] ?? null;
+        if (!$phone) {
+            continue;
+        }
+
+        // Telegram phones typically stored without leading +
+        if ($phone[0] !== '+') {
+            $phone = '+' . $phone;
+        }
+
+        $map[$phone] = $u;
     }
 
-    $width  = imagesx($src);
-    $height = imagesy($src);
+    return $map;
+}
 
-    $scale = min($maxSize / $width, $maxSize / $height, 1.0);
-
-    if ($scale < 1.0) {
-        $newW = (int) round($width * $scale);
-        $newH = (int) round($height * $scale);
-        $dst  = imagecreatetruecolor($newW, $newH);
-        imagecopyresampled($dst, $src, 0, 0, 0, 0, $newW, $newH, $width, $height);
-        imagedestroy($src);
-        $src = $dst;
+/**
+ * Get smallest profile photo for a user as data:image/jpeg;base64,... URI.
+ */
+function getSmallProfilePhotoAsDataUri(API $MadelineProto, array $user): ?string
+{
+    if (empty($user['id'])) {
+        return null;
     }
 
-    ob_start();
-    imagejpeg($src, null, $quality);
-    $optimized = ob_get_clean();
-    imagedestroy($src);
-
-    return $optimized !== false ? $optimized : $data;
-}
-
-// ---- Read API credentials from env ----
-$apiId   = (int) getenv('API_ID');
-$apiHash = getenv('API_HASH');
-
-if (!$apiId || !$apiHash) {
-    http_response_code(500);
-    echo json_encode([
-        'success' => false,
-        'error'   => 'API_ID and/or API_HASH environment variables are not set'
+    // photos.getUserPhotos: limit 1
+    $photos = $MadelineProto->photos->getUserPhotos([
+        'user_id' => $user,
+        'offset'  => 0,
+        'max_id'  => 0,
+        'limit'   => 1,
     ]);
-    exit;
-}
 
-// ---- Ensure Telegram session exists ----
-$sessionFile = __DIR__ . '/session.madeline';
-if (!file_exists($sessionFile)) {
-    http_response_code(500);
-    echo json_encode([
-        'success' => false,
-        'error'   => 'Telegram session not initialized. Open /login.php first and log in.'
-    ]);
-    exit;
-}
+    if (empty($photos['photos'][0])) {
+        return null;
+    }
 
-// ---- Initialize MadelineProto ----
-try {
-    $settings = new Settings;
+    $photo = $photos['photos'][0];
 
-    $settings->getAppInfo()
-        ->setApiId($apiId)
-        ->setApiHash($apiHash)
-        ->setDeviceModel('Railway PHP client')
-        ->setSystemVersion('Railway PHP 8.x')
-        ->setAppVersion('1.0');
+    // Try to pick the smallest size from 'sizes'
+    $smallest = null;
+    $smallestArea = null;
 
-    $settings->getLogger()
-        ->setLevel(Logger::LEVEL_ERROR);
-
-    $MadelineProto = new API($sessionFile, $settings);
-    $MadelineProto->start();
-} catch (Throwable $e) {
-    http_response_code(500);
-    echo json_encode([
-        'success' => false,
-        'error'   => 'Failed to init MadelineProto: ' . $e->getMessage(),
-    ]);
-    exit;
-}
-
-// ---- Read JSON input body ----
-$raw   = file_get_contents('php://input');
-$input = json_decode($raw, true);
-
-if (!is_array($input) || !isset($input['phones']) || !is_array($input['phones'])) {
-    http_response_code(400);
-    echo json_encode([
-        'success' => false,
-        'error'   => 'Send JSON body: { "phones": ["+2519...", "09...", "9..."], "names": ["Name A", "Name B", ...] }',
-    ]);
-    exit;
-}
-
-// Optional parallel names array (same indexes as phones[])
-$inputNames = [];
-if (isset($input['names']) && is_array($input['names'])) {
-    $inputNames = $input['names'];
-}
-
-// ---- Preload existing contacts (to preserve your contact names when possible) ----
-$existingContacts = [];
-try {
-    $contactsRes = $MadelineProto->contacts->getContacts();
-    if (!empty($contactsRes['users'])) {
-        foreach ($contactsRes['users'] as $u) {
-            if (!empty($u['phone'])) {
-                $storedDigits = preg_replace('/\D+/', '', $u['phone']);
-                if ($storedDigits !== '') {
-                    $existingContacts[$storedDigits] = [
-                        'first_name' => $u['first_name'] ?? '',
-                        'last_name'  => $u['last_name'] ?? '',
-                    ];
-                }
+    if (isset($photo['sizes']) && is_array($photo['sizes']) && count($photo['sizes']) > 0) {
+        foreach ($photo['sizes'] as $size) {
+            $w = $size['w'] ?? null;
+            $h = $size['h'] ?? null;
+            if ($w === null || $h === null) {
+                continue;
+            }
+            $area = $w * $h;
+            if ($smallest === null || $area < $smallestArea) {
+                $smallest = $size;
+                $smallestArea = $area;
             }
         }
     }
-} catch (Throwable $e) {
-    // If this fails, we just won't preserve names
+
+    if ($smallest !== null) {
+        $bytes = $MadelineProto->downloadToBytes($smallest);
+    } else {
+        // fallback: download the whole photo object
+        $bytes = $MadelineProto->downloadToBytes($photo);
+    }
+
+    if (!is_string($bytes) || $bytes === '') {
+        return null;
+    }
+
+    $b64 = base64_encode($bytes);
+    return 'data:image/jpeg;base64,' . $b64;
 }
-
-$result = [];
-
-// We keep order; no dedupe here so names[] stays aligned.
-// You can dedupe on the caller side if you want.
-$phones = array_values(array_map('strval', $input['phones']));
-
-foreach ($phones as $idx => $rawPhone) {
-    $rawPhone = trim($rawPhone);
-    if ($rawPhone === '') {
-        continue;
-    }
-
-    // Normalize Ethiopian mobiles: always use canonical +2519xxxxxxxx
-    $canonical = et_format_for_tg($rawPhone);
-    if ($canonical === null) {
-        $result[] = [
-            'phone'   => $rawPhone,
-            'user'    => null,
-            'photos'  => [],
-            'error'   => 'Cannot normalize phone to +2519xxxxxxxx',
-        ];
-        continue;
-    }
-
-    // Digits-only for contact import: e.g. "251910902269"
-    $digits     = preg_replace('/\D+/', '', $canonical);
-    $localPhone = substr($digits, -9); // "910902269"
-
-    // Name from caller (BigQuery), if provided
-    $providedName = '';
-    if (array_key_exists($idx, $inputNames) && is_string($inputNames[$idx])) {
-        $providedName = trim($inputNames[$idx]);
-    }
-
-    $entry = [
-        'phone'   => $canonical,
-        'user'    => null,
-        'photos'  => [],
-        'error'   => null,
-    ];
-
-    try {
-        // Decide name to use when importing (preserve existing contact name if possible,
-        // else use provided BigQuery name, else fallback "Imported").
-        $existing = $existingContacts[$digits] ?? null;
-
-        $firstName = 'Imported';
-        $lastName  = '';
-
-        if ($existing && trim(($existing['first_name'] ?? '') . ($existing['last_name'] ?? '')) !== '') {
-            $firstName = $existing['first_name'] ?: 'Imported';
-            $lastName  = $existing['last_name']  ?? '';
-        } elseif ($providedName !== '') {
-            $firstName = $providedName;
-            $lastName  = '';
-        }
-
-        // Import/refresh contact (needed for "My Contacts" photo privacy)
-        $importRes = $MadelineProto->contacts->importContacts([
-            'contacts' => [
-                [
-                    '_'          => 'inputPhoneContact',
-                    'phone'      => $digits,   // "2519xxxxxxxx"
-                    'first_name' => $firstName,
-                    'last_name'  => $lastName,
-                ],
-            ],
-        ]);
-
-        $userId  = null;
-        $userRaw = null;
-
-        if (!empty($importRes['users'])) {
-            $userRaw = reset($importRes['users']);
-            $userId  = $userRaw['id'];
-        }
-
-        if ($userId === null) {
-            $entry['error'] = 'User not found, not on Telegram, or not visible for this account';
-            $result[] = $entry;
-            continue;
-        }
-
-        // Basic user info (their Telegram profile name etc.)
-        $entry['user'] = [
-            'id'         => $userRaw['id']         ?? null,
-            'username'   => $userRaw['username']   ?? null,
-            'first_name' => $userRaw['first_name'] ?? null,
-            'last_name'  => $userRaw['last_name']  ?? null,
-            'phone'      => $userRaw['phone']      ?? null,
-            'bot'        => $userRaw['bot']        ?? false,
-        ];
-
-        // Fetch only the first profile photo for speed
-        $photosRes = $MadelineProto->photos->getUserPhotos([
-            'user_id' => $userId,
-            'offset'  => 0,
-            'max_id'  => 0,
-            'limit'   => 1,
-        ]);
-
-        if (empty($photosRes['photos'])) {
-            // No visible photos
-            $result[] = $entry;
-            continue;
-        }
-
-        $photo = $photosRes['photos'][0];
-
-        // Download to a temporary file
-        $tmpFile = tempnam(sys_get_temp_dir(), 'tg_');
-        $MadelineProto->downloadToFile($photo, $tmpFile);
-
-        $data = file_get_contents($tmpFile);
-        @unlink($tmpFile);
-
-        if ($data === false || $data === '') {
-            $result[] = $entry;
-            continue;
-        }
-
-        // Downscale & recompress for speed / size
-        $optimized = optimize_image_jpeg($data, 256, 80);
-
-        $b64 = base64_encode($optimized);
-        $dataUri = 'data:image/jpeg;base64,' . $b64;
-
-        $entry['photos'][] = [
-            'data_uri' => $dataUri,
-            'mime'     => 'image/jpeg',
-            'phone'    => $canonical,
-        ];
-
-        $result[] = $entry;
-    } catch (Throwable $e) {
-        $entry['error'] = $e->getMessage();
-        $result[] = $entry;
-    }
-}
-
-echo json_encode(
-    [
-        'success' => true,
-        'results' => $result,
-    ],
-    JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT
-);
