@@ -5,6 +5,16 @@ header('Content-Type: application/json');
 
 require __DIR__ . '/vendor/autoload.php';
 
+// Make sure Telegram session exists (created by running login.php locally)
+if (!file_exists(__DIR__ . '/session.madeline')) {
+    http_response_code(500);
+    echo json_encode([
+        'success' => false,
+        'error'   => 'Telegram session not initialized. Run `php login.php` locally, then commit and push session.madeline.'
+    ]);
+    exit;
+}
+
 use danog\MadelineProto\API;
 use danog\MadelineProto\Settings;
 use danog\MadelineProto\Logger;
