@@ -1,13 +1,6 @@
-cat > composer.json << 'EOF'
 {
   "require": {
     "php": "^8.2",
-    "danog/madelineproto": "^8.1"
-  },
-  "require-dev": {
-    "ext-bcmath": "*",
-    "ext-sockets": "*",
-    "ext-mbstring": "*"
+    "danog/madelineproto": "^8.0"
   }
 }
-EOF
