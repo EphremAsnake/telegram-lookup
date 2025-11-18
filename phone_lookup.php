@@ -55,7 +55,44 @@ function et_format_for_tg(string $raw): ?string {
     return '+251' . $digits; // canonical E.164
 }
 
-// ---- Read API credentials from env (used when creating session initially) ----
+/**
+ * Resize & recompress JPEG image data (in memory) using GD, return new binary.
+ * If GD not available or something fails, original data is returned.
+ */
+function optimize_image_jpeg(string $data, int $maxSize = 256, int $quality = 80): string
+{
+    if (!extension_loaded('gd')) {
+        return $data;
+    }
+
+    $src = @imagecreatefromstring($data);
+    if (!$src) {
+        return $data;
+    }
+
+    $width  = imagesx($src);
+    $height = imagesy($src);
+
+    $scale = min($maxSize / $width, $maxSize / $height, 1.0);
+
+    if ($scale < 1.0) {
+        $newW = (int) round($width * $scale);
+        $newH = (int) round($height * $scale);
+        $dst  = imagecreatetruecolor($newW, $newH);
+        imagecopyresampled($dst, $src, 0, 0, 0, 0, $newW, $newH, $width, $height);
+        imagedestroy($src);
+        $src = $dst;
+    }
+
+    ob_start();
+    imagejpeg($src, null, $quality);
+    $optimized = ob_get_clean();
+    imagedestroy($src);
+
+    return $optimized !== false ? $optimized : $data;
+}
+
+// ---- Read API credentials from env ----
 $apiId   = (int) getenv('API_ID');
 $apiHash = getenv('API_HASH');
 
@@ -117,7 +154,7 @@ if (!is_array($input) || !isset($input['phones']) || !is_array($input['phones'])
     exit;
 }
 
-// ---- Preload existing contacts (to preserve names when possible) ----
+// ---- Preload existing contacts (to preserve your contact names when possible) ----
 $existingContacts = [];
 try {
     $contactsRes = $MadelineProto->contacts->getContacts();
@@ -140,13 +177,16 @@ try {
 
 $result = [];
 
-foreach ($input['phones'] as $rawPhone) {
-    $rawPhone = trim((string) $rawPhone);
+// Dedupe phones for speed
+$phones = array_values(array_unique(array_map('strval', $input['phones'])));
+
+foreach ($phones as $rawPhone) {
+    $rawPhone = trim($rawPhone);
     if ($rawPhone === '') {
         continue;
     }
 
-    // Normalize Ethiopian mobiles: always store canonical +2519xxxxxxxx
+    // Normalize Ethiopian mobiles: always use canonical +2519xxxxxxxx
     $canonical = et_format_for_tg($rawPhone);
     if ($canonical === null) {
         $result[] = [
@@ -207,7 +247,7 @@ foreach ($input['phones'] as $rawPhone) {
             continue;
         }
 
-        // Basic user info
+        // Basic user info (their Telegram profile name etc.)
         $entry['user'] = [
             'id'         => $userRaw['id']         ?? null,
             'username'   => $userRaw['username']   ?? null,
@@ -233,53 +273,28 @@ foreach ($input['phones'] as $rawPhone) {
 
         $photo = $photosRes['photos'][0];
 
-        // Ensure photos folder exists
-        $photosDir = __DIR__ . '/photos';
-        if (!is_dir($photosDir)) {
-            mkdir($photosDir, 0775, true);
+        // Download to a temporary file
+        $tmpFile = tempnam(sys_get_temp_dir(), 'tg_');
+        $MadelineProto->downloadToFile($photo, $tmpFile);
+
+        $data = file_get_contents($tmpFile);
+        @unlink($tmpFile);
+
+        if ($data === false || $data === '') {
+            $result[] = $entry;
+            continue;
         }
 
-        // Build filename base: 910902269_name
-        $fullName = trim(
-            ($userRaw['first_name'] ?? '') . ' ' . ($userRaw['last_name'] ?? '')
-        );
-        if ($fullName === '') {
-            $fullName = 'telegram_user';
-        }
+        // Downscale & recompress for speed / size
+        $optimized = optimize_image_jpeg($data, 256, 80);
 
-        $nameSlug = strtolower($fullName);
-        $nameSlug = preg_replace('/[^a-z0-9]+/i', '_', $nameSlug);
-        $nameSlug = trim($nameSlug, '_');
-
-        $fileName = $localPhone . '_' . $nameSlug . '.jpg';
-        $filePath = $photosDir . '/' . $fileName;
-
-        // Download the photo (default size). If we need smaller, we can resize later.
-        $MadelineProto->downloadToFile($photo, $filePath);
-
-        // Build public URL (based on current request)
-        // Prefer forwarded proto (Railway / proxies), fallback to https
-		$scheme = 'https';
-		if (!empty($_SERVER['HTTP_X_FORWARDED_PROTO'])) {
-    		$scheme = $_SERVER['HTTP_X_FORWARDED_PROTO'];
-		}
-		$host     = $_SERVER['HTTP_HOST'] ?? 'localhost';
-		$basePath = rtrim(dirname($_SERVER['PHP_SELF']), '/');
-
-        $host     = $_SERVER['HTTP_HOST'] ?? 'localhost';
-        $basePath = rtrim(dirname($_SERVER['PHP_SELF']), '/');
-
-        $publicUrl = sprintf(
-            '%s://%s%s/photos/%s',
-            $scheme,
-            $host,
-            $basePath,
-            $fileName
-        );
+        $b64 = base64_encode($optimized);
+        $dataUri = 'data:image/jpeg;base64,' . $b64;
 
         $entry['photos'][] = [
-            'file' => $fileName,
-            'url'  => $publicUrl,
+            'data_uri' => $dataUri,
+            'mime'     => 'image/jpeg',
+            'phone'    => $canonical,
         ];
 
         $result[] = $entry;
