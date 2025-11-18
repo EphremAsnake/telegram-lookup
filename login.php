@@ -77,7 +77,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$loggedIn) {
                 $MadelineProto->phoneLogin($phone);
                 $_SESSION['tg_phone']     = $phone;
                 $_SESSION['tg_code_sent'] = true;
-                $message                  = 'Code sent. Check Telegram or SMS and enter the code below.';
+                $message                  = 'Code sent. Check your Telegram app or SMS and enter the code below.';
                 $step                     = 'code';
             } catch (Throwable $e) {
                 $message = 'Error sending code: ' . $e->getMessage();
@@ -266,8 +266,8 @@ if ($loggedIn) {
     <?php elseif ($step === 'phone'): ?>
         <form method="post">
             <input type="hidden" name="action" value="send_phone">
-            <label for="phone">Phone number (with +251)</label>
-            <input type="text" id="phone" name="phone" placeholder="+2519xxxxxxxx">
+            <label for="phone">Phone number (with country code)</label>
+            <input type="text" id="phone" name="phone" placeholder="+1234567890">
             <button type="submit">Send login code</button>
             <div class="hint">Telegram will send a login code to this phone or your Telegram app.</div>
         </form>
