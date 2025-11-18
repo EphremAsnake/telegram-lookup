@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 $path = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH);
 
-// Simple router: send /login.php and /phone_lookup.php to their scripts
 switch ($path) {
     case '/login.php':
         require __DIR__ . '/login.php';

@@ -1,16 +1,20 @@
 <?php
-// login.php - Web-based login for MadelineProto on Railway
+// login.php - Web-based login for MadelineProto on Railway, using madeline.php (no Composer)
 
 declare(strict_types=1);
 
 header('Content-Type: text/html; charset=utf-8');
 
-require __DIR__ . '/vendor/autoload.php';
+// ---- Load MadelineProto from madeline.php (single-file install) ----
+if (!file_exists(__DIR__ . '/madeline.php')) {
+    // Simple auto-download; fine for this personal tool
+    copy('https://phar.madelineproto.xyz/madeline.php', __DIR__ . '/madeline.php');
+}
+require __DIR__ . '/madeline.php';
 
 use danog\MadelineProto\API;
 use danog\MadelineProto\Settings;
 use danog\MadelineProto\Logger;
-use danog\MadelineProto\Tools;
 
 session_start();
 
@@ -32,7 +36,7 @@ try {
         ->setApiId($apiId)
         ->setApiHash($apiHash)
         ->setDeviceModel('Railway PHP client')
-        ->setSystemVersion('Railway PHP 8.2')
+        ->setSystemVersion('Railway PHP 8.x')
         ->setAppVersion('1.0');
 
     $settings->getLogger()
@@ -46,7 +50,7 @@ try {
 }
 
 $message   = '';
-$step      = 'phone';   // phone | code | password
+$step      = 'phone';   // phone | code | password | done
 $need2FA   = false;
 $loggedIn  = false;
 
@@ -57,12 +61,12 @@ try {
         $loggedIn = true;
     }
 } catch (Throwable $e) {
-    // Not logged in yet, ignore
+    // Not logged in yet
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$loggedIn) {
     // Step 1: send code
-    if (isset($_POST['action']) && $_POST['action'] === 'send_phone') {
+    if (($_POST['action'] ?? '') === 'send_phone') {
         $phone = trim((string) ($_POST['phone'] ?? ''));
 
         if ($phone === '') {
@@ -70,7 +74,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$loggedIn) {
             $step    = 'phone';
         } else {
             try {
-                // Send login code
                 $MadelineProto->phoneLogin($phone);
                 $_SESSION['tg_phone']     = $phone;
                 $_SESSION['tg_code_sent'] = true;
@@ -83,7 +86,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$loggedIn) {
         }
     }
     // Step 2: complete with code
-    elseif (isset($_POST['action']) && $_POST['action'] === 'send_code' && !empty($_SESSION['tg_code_sent'])) {
+    elseif (($_POST['action'] ?? '') === 'send_code' && !empty($_SESSION['tg_code_sent'])) {
         $code = trim((string) ($_POST['code'] ?? ''));
 
         if ($code === '') {
@@ -95,7 +98,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$loggedIn) {
 
                 if (is_array($authorization) && isset($authorization['_'])) {
                     if ($authorization['_'] === 'account.password') {
-                        // 2FA enabled, ask for password
+                        // 2FA
                         $_SESSION['tg_needs_2fa'] = true;
                         $message                  = 'This account has 2FA enabled. Enter your Telegram password.';
                         $step                     = 'password';
@@ -121,7 +124,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$loggedIn) {
         }
     }
     // Step 3: 2FA password
-    elseif (isset($_POST['action']) && $_POST['action'] === 'send_password' && !empty($_SESSION['tg_needs_2fa'])) {
+    elseif (($_POST['action'] ?? '') === 'send_password' && !empty($_SESSION['tg_needs_2fa'])) {
         $password = (string) ($_POST['password'] ?? '');
 
         if ($password === '') {
@@ -147,7 +150,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$loggedIn) {
 if ($loggedIn) {
     $step = 'done';
 }
-
 ?>
 <!DOCTYPE html>
 <html lang="en">
