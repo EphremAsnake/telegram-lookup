@@ -105,8 +105,16 @@ if (!$apiId || !$apiHash) {
     exit;
 }
 
-// ---- Session file (persist login) ----
-$sessionFile = __DIR__ . '/telegram_lookup.session';
+// ---- Ensure Telegram session exists ----
+$sessionFile = __DIR__ . '/session.madeline';
+if (!file_exists($sessionFile)) {
+    http_response_code(500);
+    echo json_encode([
+        'success' => false,
+        'error'   => 'Telegram session not initialized. Open /login.php first and log in.'
+    ]);
+    exit;
+}
 
 // ---- Initialize MadelineProto ----
 try {
@@ -158,7 +166,7 @@ if (isset($input['names']) && is_array($input['names'])) {
 }
 
 // ---- Contacts housekeeping: limit total saved contacts on dedicated lookup account ----
-$existingContacts = []; // we no longer preload names; this account is used only for lookups
+$existingContacts = [];
 try {
     $contactsRes = $MadelineProto->contacts->getContacts();
     $contactCount = 0;
@@ -167,7 +175,7 @@ try {
         $contactCount = count($contactsRes['users']);
     }
 
-    if ($contactCount > 2000) {
+    if ($contactCount > 1000) {
         // Too many contacts saved in the Telegram cloud for this dedicated account.
         // We clear them to avoid hitting Telegram limits and to keep the account clean.
         try {
@@ -188,8 +196,7 @@ try {
         }
     }
 
-    // Intentionally NOT preserving existing contact names:
-    // all names come from the request payload or fall back to "Imported".
+    // We intentionally do not preload or preserve existing contact names for this account.
 } catch (Throwable $e) {
     // If this fails, we simply continue without contact housekeeping.
 }
@@ -209,20 +216,20 @@ foreach ($phones as $idx => $rawPhone) {
     // Normalize Ethiopian mobiles: always use canonical +2519xxxxxxxx
     $canonical = et_format_for_tg($rawPhone);
     if ($canonical === null) {
-        $entry = [
+        $result[] = [
             'phone'   => $rawPhone,
             'user'    => null,
             'photos'  => [],
-            'error'   => 'Invalid Ethiopian mobile format',
+            'error'   => 'Cannot normalize phone to +2519xxxxxxxx',
         ];
-        $result[] = $entry;
         continue;
     }
 
+    // Digits-only for contact import: e.g. "251910902269"
     $digits     = preg_replace('/\D+/', '', $canonical);
-    $localPhone = substr($digits, -9); // "9xxxxxxxxx"
+    $localPhone = substr($digits, -9); // "910902269"
 
-    // Name from caller, if provided
+    // Name from caller (BigQuery), if provided
     $providedName = '';
     if (array_key_exists($idx, $inputNames) && is_string($inputNames[$idx])) {
         $providedName = trim($inputNames[$idx]);
