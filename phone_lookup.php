@@ -1,19 +1,14 @@
 <?php
 // phone_lookup.php: HTTP API to look up Telegram user + profile photo by phone
+declare(strict_types=1);
 
 header('Content-Type: application/json');
 
-require __DIR__ . '/vendor/autoload.php';
-
-// Make sure Telegram session exists (created by running login.php locally)
-if (!file_exists(__DIR__ . '/session.madeline')) {
-    http_response_code(500);
-    echo json_encode([
-        'success' => false,
-        'error'   => 'Telegram session not initialized. Run `php login.php` locally, then commit and push session.madeline.'
-    ]);
-    exit;
+// ---- Load MadelineProto from madeline.php (single-file install) ----
+if (!file_exists(__DIR__ . '/madeline.php')) {
+    copy('https://phar.madelineproto.xyz/madeline.php', __DIR__ . '/madeline.php');
 }
+require __DIR__ . '/madeline.php';
 
 use danog\MadelineProto\API;
 use danog\MadelineProto\Settings;
@@ -22,6 +17,7 @@ use danog\MadelineProto\Logger;
 /**
  * Normalize Ethiopian phone to canonical +2519xxxxxxxx
  * Accepts: 9xxxxxxxx, 09xxxxxxxx, 2519xxxxxxxx, +2519xxxxxxxx, etc.
+ * Returns null if cannot normalize.
  */
 function et_format_for_tg(string $raw): ?string {
     $digits = preg_replace('/\D+/', '', $raw);
@@ -59,20 +55,31 @@ function et_format_for_tg(string $raw): ?string {
     return '+251' . $digits; // canonical E.164
 }
 
-// Read API credentials from environment
+// ---- Read API credentials from env (used when creating session initially) ----
 $apiId   = (int) getenv('API_ID');
 $apiHash = getenv('API_HASH');
 
 if (!$apiId || !$apiHash) {
     http_response_code(500);
     echo json_encode([
-        'error'   => 'API_ID and/or API_HASH environment variables are not set',
         'success' => false,
+        'error'   => 'API_ID and/or API_HASH environment variables are not set'
     ]);
     exit;
 }
 
-// Initialize MadelineProto
+// ---- Ensure Telegram session exists ----
+$sessionFile = __DIR__ . '/session.madeline';
+if (!file_exists($sessionFile)) {
+    http_response_code(500);
+    echo json_encode([
+        'success' => false,
+        'error'   => 'Telegram session not initialized. Open /login.php first and log in.'
+    ]);
+    exit;
+}
+
+// ---- Initialize MadelineProto ----
 try {
     $settings = new Settings;
 
@@ -80,44 +87,43 @@ try {
         ->setApiId($apiId)
         ->setApiHash($apiHash)
         ->setDeviceModel('Railway PHP client')
-        ->setSystemVersion('Railway PHP 8.2')
+        ->setSystemVersion('Railway PHP 8.x')
         ->setAppVersion('1.0');
 
     $settings->getLogger()
         ->setLevel(Logger::LEVEL_ERROR);
 
-    $MadelineProto = new API('session.madeline', $settings);
+    $MadelineProto = new API($sessionFile, $settings);
     $MadelineProto->start();
 } catch (Throwable $e) {
     http_response_code(500);
     echo json_encode([
-        'error'   => 'Failed to init MadelineProto: ' . $e->getMessage(),
         'success' => false,
+        'error'   => 'Failed to init MadelineProto: ' . $e->getMessage(),
     ]);
     exit;
 }
 
-// Read JSON input body
+// ---- Read JSON input body ----
 $raw   = file_get_contents('php://input');
 $input = json_decode($raw, true);
 
 if (!is_array($input) || !isset($input['phones']) || !is_array($input['phones'])) {
     http_response_code(400);
     echo json_encode([
-        'error'   => 'Send JSON body: { "phones": ["+2519...", "09...", "9..."] }',
         'success' => false,
+        'error'   => 'Send JSON body: { "phones": ["+2519...", "09...", "9..."] }',
     ]);
     exit;
 }
 
-// Load existing contacts once to avoid renaming them to "Imported"
+// ---- Preload existing contacts (to preserve names when possible) ----
 $existingContacts = [];
 try {
     $contactsRes = $MadelineProto->contacts->getContacts();
     if (!empty($contactsRes['users'])) {
         foreach ($contactsRes['users'] as $u) {
             if (!empty($u['phone'])) {
-                // Normalize stored phones to digits (e.g. 2519..., or 9...)
                 $storedDigits = preg_replace('/\D+/', '', $u['phone']);
                 if ($storedDigits !== '') {
                     $existingContacts[$storedDigits] = [
@@ -140,7 +146,7 @@ foreach ($input['phones'] as $rawPhone) {
         continue;
     }
 
-    // Canonical E.164: +2519xxxxxxxx
+    // Normalize Ethiopian mobiles: always store canonical +2519xxxxxxxx
     $canonical = et_format_for_tg($rawPhone);
     if ($canonical === null) {
         $result[] = [
@@ -152,19 +158,19 @@ foreach ($input['phones'] as $rawPhone) {
         continue;
     }
 
-    // For Telegram contact import, use digits only: 2519xxxxxxxx
-    $digits     = preg_replace('/\D+/', '', $canonical); // "251910902269"
-    $localPhone = substr($digits, -9);                   // "910902269"
+    // Digits-only for contact import: e.g. "251910902269"
+    $digits     = preg_replace('/\D+/', '', $canonical);
+    $localPhone = substr($digits, -9); // "910902269"
 
     $entry = [
-        'phone'   => $canonical, // always return canonical
+        'phone'   => $canonical,
         'user'    => null,
         'photos'  => [],
         'error'   => null,
     ];
 
     try {
-        // Decide name to use in import, preserving existing if present
+        // Decide name to use when importing (preserve existing name if possible)
         $existing = $existingContacts[$digits] ?? null;
 
         $firstName = 'Imported';
@@ -175,7 +181,7 @@ foreach ($input['phones'] as $rawPhone) {
             $lastName  = $existing['last_name']  ?: '';
         }
 
-        // Import or refresh contact (needed so "My Contacts" privacy works)
+        // Import/refresh contact (needed for "My Contacts" photo privacy)
         $importRes = $MadelineProto->contacts->importContacts([
             'contacts' => [
                 [
@@ -201,7 +207,7 @@ foreach ($input['phones'] as $rawPhone) {
             continue;
         }
 
-        // User info
+        // Basic user info
         $entry['user'] = [
             'id'         => $userRaw['id']         ?? null,
             'username'   => $userRaw['username']   ?? null,
@@ -216,7 +222,7 @@ foreach ($input['phones'] as $rawPhone) {
             'user_id' => $userId,
             'offset'  => 0,
             'max_id'  => 0,
-            'limit'   => 1, // 1 photo only
+            'limit'   => 1,
         ]);
 
         if (empty($photosRes['photos'])) {
@@ -225,14 +231,15 @@ foreach ($input['phones'] as $rawPhone) {
             continue;
         }
 
-        $photo = $photosRes['photos'][0]; // single photo object
+        $photo = $photosRes['photos'][0];
 
+        // Ensure photos folder exists
         $photosDir = __DIR__ . '/photos';
         if (!is_dir($photosDir)) {
             mkdir($photosDir, 0775, true);
         }
 
-        // Build base: 910902269_name
+        // Build filename base: 910902269_name
         $fullName = trim(
             ($userRaw['first_name'] ?? '') . ' ' . ($userRaw['last_name'] ?? '')
         );
@@ -244,14 +251,13 @@ foreach ($input['phones'] as $rawPhone) {
         $nameSlug = preg_replace('/[^a-z0-9]+/i', '_', $nameSlug);
         $nameSlug = trim($nameSlug, '_');
 
-        // Final file name: 910902269_name.jpg
         $fileName = $localPhone . '_' . $nameSlug . '.jpg';
         $filePath = $photosDir . '/' . $fileName;
 
-        // Download the photo as-is (no resizing for now; can optimize later)
+        // Download the photo (default size). If we need smaller, we can resize later.
         $MadelineProto->downloadToFile($photo, $filePath);
 
-        // Build public URL based on current request
+        // Build public URL (based on current request)
         $scheme   = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
         $host     = $_SERVER['HTTP_HOST'] ?? 'localhost';
         $basePath = rtrim(dirname($_SERVER['PHP_SELF']), '/');
