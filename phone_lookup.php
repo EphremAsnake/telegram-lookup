@@ -125,11 +125,10 @@ try {
         ->setApiHash($apiHash)
         ->setDeviceModel('Railway PHP client')
         ->setSystemVersion('Railway PHP 8.x')
-        ->setAppVersion('Telegram Lookup 1.0')
-        ->setLangCode('en');
+        ->setAppVersion('1.0');
 
     $settings->getLogger()
-        ->setLevel(Logger::ERROR);
+        ->setLevel(Logger::LEVEL_ERROR);
 
     $MadelineProto = new API($sessionFile, $settings);
     $MadelineProto->start();
@@ -146,11 +145,7 @@ try {
 $raw   = file_get_contents('php://input');
 $input = json_decode($raw, true);
 
-if (!is_array($input) ||
-    !isset($input['phones']) ||
-    !is_array($input['phones']) ||
-    empty($input['phones'])
-) {
+if (!is_array($input) || !isset($input['phones']) || !is_array($input['phones'])) {
     http_response_code(400);
     echo json_encode([
         'success' => false,
@@ -165,40 +160,28 @@ if (isset($input['names']) && is_array($input['names'])) {
     $inputNames = $input['names'];
 }
 
-// ---- Contacts housekeeping: limit total saved contacts on dedicated lookup account ----
-$existingContacts = [];
+// ---- Check contact count and clear if needed ----
 try {
     $contactsRes = $MadelineProto->contacts->getContacts();
-    $contactCount = 0;
-
-    if (!empty($contactsRes['users']) && is_array($contactsRes['users'])) {
-        $contactCount = count($contactsRes['users']);
-    }
-
+    $contactCount = !empty($contactsRes['users']) ? count($contactsRes['users']) : 0;
+    
+    // If we have more than 1000 contacts, clear all to free up space
     if ($contactCount > 1000) {
-        // Too many contacts saved in the Telegram cloud for this dedicated account.
-        // We clear them to avoid hitting Telegram limits and to keep the account clean.
-        try {
-            $idsToDelete = [];
-            foreach ($contactsRes['users'] as $u) {
-                if (isset($u['id'])) {
-                    $idsToDelete[] = $u['id'];
-                }
+        $allContacts = !empty($contactsRes['users']) ? $contactsRes['users'] : [];
+        $contactIds = [];
+        
+        foreach ($allContacts as $contact) {
+            if (!empty($contact['id'])) {
+                $contactIds[] = $contact['id'];
             }
-
-            if (!empty($idsToDelete)) {
-                $MadelineProto->contacts->deleteContacts([
-                    'id' => $idsToDelete,
-                ]);
-            }
-        } catch (Throwable $inner) {
-            // Ignore cleanup errors; lookup will still continue.
+        }
+        
+        if (!empty($contactIds)) {
+            $MadelineProto->contacts->deleteContacts(['id' => $contactIds]);
         }
     }
-
-    // We intentionally do not preload or preserve existing contact names for this account.
 } catch (Throwable $e) {
-    // If this fails, we simply continue without contact housekeeping.
+    // If this fails, we continue anyway - might be rate limited or other issue
 }
 
 $result = [];
@@ -243,21 +226,16 @@ foreach ($phones as $idx => $rawPhone) {
     ];
 
     try {
-        // Decide name to use when importing: prefer provided name from request,
-        // otherwise fall back to a generic placeholder. We do NOT preserve any
-        // previously saved contact names on this dedicated lookup account.
-        $firstName = 'Imported';
+        // Always use provided name if available, otherwise use "Imported"
+        $firstName = $providedName !== '' ? $providedName : 'Imported';
         $lastName  = '';
-
-        if ($providedName !== '') {
-            $firstName = $providedName;
-        }
 
         // Import/refresh contact (needed for "My Contacts" photo privacy)
         $importRes = $MadelineProto->contacts->importContacts([
             'contacts' => [
                 [
-                    'phone'      => $localPhone,
+                    '_'          => 'inputPhoneContact',
+                    'phone'      => $digits,   // "2519xxxxxxxx"
                     'first_name' => $firstName,
                     'last_name'  => $lastName,
                 ],
@@ -278,43 +256,55 @@ foreach ($phones as $idx => $rawPhone) {
             continue;
         }
 
-        // Basic user info
+        // Basic user info (their Telegram profile name etc.)
         $entry['user'] = [
-            'id'         => $userRaw['id'] ?? null,
-            'username'   => $userRaw['username'] ?? null,
+            'id'         => $userRaw['id']         ?? null,
+            'username'   => $userRaw['username']   ?? null,
             'first_name' => $userRaw['first_name'] ?? null,
-            'last_name'  => $userRaw['last_name'] ?? null,
-            'phone'      => $userRaw['phone'] ?? null,
-            'bot'        => $userRaw['bot'] ?? false,
+            'last_name'  => $userRaw['last_name']  ?? null,
+            'phone'      => $userRaw['phone']      ?? null,
+            'bot'        => $userRaw['bot']        ?? false,
         ];
 
-        // Fetch profile photos
+        // Fetch only the first profile photo for speed
         $photosRes = $MadelineProto->photos->getUserPhotos([
             'user_id' => $userId,
             'offset'  => 0,
             'max_id'  => 0,
-            'limit'   => 5,
+            'limit'   => 1,
         ]);
 
-        if (!empty($photosRes['photos'])) {
-            foreach ($photosRes['photos'] as $photo) {
-                try {
-                    $file = $MadelineProto->downloadToString($photo);
-
-                    // Optimize (resize + recompress)
-                    $fileOptimized = optimize_image_jpeg($file, 256, 80);
-                    $base64        = base64_encode($fileOptimized);
-
-                    $entry['photos'][] = [
-                        'data_uri' => 'data:image/jpeg;base64,' . $base64,
-                        'mime'     => 'image/jpeg',
-                        'phone'    => $canonical,
-                    ];
-                } catch (Throwable $e) {
-                    // Ignore broken photos but keep others
-                }
-            }
+        if (empty($photosRes['photos'])) {
+            // No visible photos
+            $result[] = $entry;
+            continue;
         }
+
+        $photo = $photosRes['photos'][0];
+
+        // Download to a temporary file
+        $tmpFile = tempnam(sys_get_temp_dir(), 'tg_');
+        $MadelineProto->downloadToFile($photo, $tmpFile);
+
+        $data = file_get_contents($tmpFile);
+        @unlink($tmpFile);
+
+        if ($data === false || $data === '') {
+            $result[] = $entry;
+            continue;
+        }
+
+        // Downscale & recompress for speed / size
+        $optimized = optimize_image_jpeg($data, 256, 80);
+
+        $b64 = base64_encode($optimized);
+        $dataUri = 'data:image/jpeg;base64,' . $b64;
+
+        $entry['photos'][] = [
+            'data_uri' => $dataUri,
+            'mime'     => 'image/jpeg',
+            'phone'    => $canonical,
+        ];
 
         $result[] = $entry;
     } catch (Throwable $e) {
