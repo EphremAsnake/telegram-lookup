@@ -258,7 +258,14 @@ foreach ($input['phones'] as $rawPhone) {
         $MadelineProto->downloadToFile($photo, $filePath);
 
         // Build public URL (based on current request)
-        $scheme   = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+        // Prefer forwarded proto (Railway / proxies), fallback to https
+		$scheme = 'https';
+		if (!empty($_SERVER['HTTP_X_FORWARDED_PROTO'])) {
+    		$scheme = $_SERVER['HTTP_X_FORWARDED_PROTO'];
+		}
+		$host     = $_SERVER['HTTP_HOST'] ?? 'localhost';
+		$basePath = rtrim(dirname($_SERVER['PHP_SELF']), '/');
+
         $host     = $_SERVER['HTTP_HOST'] ?? 'localhost';
         $basePath = rtrim(dirname($_SERVER['PHP_SELF']), '/');
 
