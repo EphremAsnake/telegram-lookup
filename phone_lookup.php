@@ -184,6 +184,11 @@ for ($i = 0; $i < count($phones); $i += $batchSize) {
     $batchPhones = array_slice($phones, $i, $batchSize);
     $batchResult = processPhoneBatch($MadelineProto, $batchPhones, $inputNames, $i);
     $result = array_merge($result, $batchResult);
+    
+    // Add delay between batches to avoid flood waits
+    if ($i + $batchSize < count($phones)) {
+        sleep(1);
+    }
 }
 
 echo json_encode(
@@ -195,24 +200,30 @@ echo json_encode(
 );
 
 /**
- * Process a batch of phones asynchronously
+ * Process a batch of phones
  */
 function processPhoneBatch(API $MadelineProto, array $batchPhones, array $inputNames, int $offset): array {
-    $promises = [];
-    $batchData = [];
+    $batchResults = [];
     
-    // Prepare batch data
+    // Prepare batch data and normalize phones
+    $normalizedPhones = [];
     foreach ($batchPhones as $idx => $rawPhone) {
         $globalIdx = $offset + $idx;
         $rawPhone = trim($rawPhone);
         if ($rawPhone === '') {
+            $batchResults[$globalIdx] = [
+                'phone'   => $rawPhone,
+                'user'    => null,
+                'photos'  => [],
+                'error'   => 'Empty phone number',
+            ];
             continue;
         }
 
         // Normalize Ethiopian mobiles
         $canonical = et_format_for_tg($rawPhone);
         if ($canonical === null) {
-            $batchData[$globalIdx] = [
+            $batchResults[$globalIdx] = [
                 'phone'   => $rawPhone,
                 'user'    => null,
                 'photos'  => [],
@@ -227,8 +238,9 @@ function processPhoneBatch(API $MadelineProto, array $batchPhones, array $inputN
             $providedName = trim($inputNames[$globalIdx]);
         }
 
-        $batchData[$globalIdx] = [
-            'phone' => $canonical,
+        $normalizedPhones[$globalIdx] = [
+            'original_phone' => $rawPhone,
+            'canonical' => $canonical,
             'digits' => $digits,
             'providedName' => $providedName,
             'globalIdx' => $globalIdx
@@ -237,18 +249,18 @@ function processPhoneBatch(API $MadelineProto, array $batchPhones, array $inputN
 
     // Import contacts in batch
     $contactsToImport = [];
-    foreach ($batchData as $data) {
-        if (isset($data['error'])) continue;
-        
+    foreach ($normalizedPhones as $globalIdx => $data) {
         $firstName = $data['providedName'] !== '' ? $data['providedName'] : 'Imported';
         $contactsToImport[] = [
             '_'          => 'inputPhoneContact',
             'phone'      => $data['digits'],
             'first_name' => $firstName,
             'last_name'  => '',
+            'client_id'  => $globalIdx // Store index to map back
         ];
     }
 
+    $importedUsers = [];
     if (!empty($contactsToImport)) {
         try {
             $importRes = $MadelineProto->contacts->importContacts([
@@ -260,10 +272,13 @@ function processPhoneBatch(API $MadelineProto, array $batchPhones, array $inputN
                 foreach ($importRes['users'] as $userRaw) {
                     $userPhone = $userRaw['phone'] ?? null;
                     if ($userPhone) {
-                        foreach ($batchData as &$data) {
-                            if (isset($data['phone']) && $data['phone'] === '+'.$userPhone) {
-                                $data['userRaw'] = $userRaw;
-                                $data['userId'] = $userRaw['id'];
+                        foreach ($normalizedPhones as $globalIdx => $data) {
+                            if ($data['canonical'] === '+'.$userPhone) {
+                                $importedUsers[$globalIdx] = [
+                                    'userRaw' => $userRaw,
+                                    'userId' => $userRaw['id'],
+                                    'phoneData' => $data
+                                ];
                                 break;
                             }
                         }
@@ -272,122 +287,82 @@ function processPhoneBatch(API $MadelineProto, array $batchPhones, array $inputN
             }
         } catch (Throwable $e) {
             // Continue with individual lookups if batch import fails
+            error_log("Batch import failed: " . $e->getMessage());
         }
     }
 
-    // Create async promises for photo lookups
-    foreach ($batchData as $data) {
-        if (isset($data['error'])) {
-            $promises[$data['globalIdx']] = $MadelineProto->callFakeAsync(function() use ($data) {
-                return [
-                    'phone'   => $data['phone'],
-                    'user'    => null,
-                    'photos'  => [],
-                    'error'   => $data['error'],
-                ];
-            });
+    // Process each phone in the batch
+    foreach ($normalizedPhones as $globalIdx => $data) {
+        // If we already have a result for this phone (from error during normalization), skip
+        if (isset($batchResults[$globalIdx])) {
             continue;
         }
 
-        if (!isset($data['userId'])) {
-            $promises[$data['globalIdx']] = $MadelineProto->callFakeAsync(function() use ($data) {
-                return [
-                    'phone'   => $data['phone'],
-                    'user'    => null,
-                    'photos'  => [],
-                    'error'   => 'User not found, not on Telegram, or not visible for this account',
-                ];
-            });
-            continue;
-        }
+        $entry = [
+            'phone'   => $data['canonical'],
+            'user'    => null,
+            'photos'  => [],
+            'error'   => null,
+        ];
 
-        $promises[$data['globalIdx']] = $MadelineProto->callFakeAsync(function() use ($MadelineProto, $data) {
-            return lookupUserPhotos($MadelineProto, $data);
-        });
-    }
-
-    // Wait for all promises to complete
-    $batchResults = [];
-    foreach ($promises as $globalIdx => $promise) {
         try {
-            $batchResults[$globalIdx] = $MadelineProto->wait($promise);
+            // Check if user was imported successfully
+            if (isset($importedUsers[$globalIdx])) {
+                $userData = $importedUsers[$globalIdx];
+                
+                // Basic user info
+                $entry['user'] = [
+                    'id'         => $userData['userRaw']['id'] ?? null,
+                    'username'   => $userData['userRaw']['username'] ?? null,
+                    'first_name' => $userData['userRaw']['first_name'] ?? null,
+                    'last_name'  => $userData['userRaw']['last_name'] ?? null,
+                    'phone'      => $userData['userRaw']['phone'] ?? null,
+                    'bot'        => $userData['userRaw']['bot'] ?? false,
+                ];
+
+                // Fetch profile photo
+                $photosRes = $MadelineProto->photos->getUserPhotos([
+                    'user_id' => $userData['userId'],
+                    'offset'  => 0,
+                    'max_id'  => 0,
+                    'limit'   => 1,
+                ]);
+
+                if (!empty($photosRes['photos'])) {
+                    $photo = $photosRes['photos'][0];
+
+                    // Download to a temporary file
+                    $tmpFile = tempnam(sys_get_temp_dir(), 'tg_');
+                    $MadelineProto->downloadToFile($photo, $tmpFile);
+
+                    $dataContent = file_get_contents($tmpFile);
+                    @unlink($tmpFile);
+
+                    if ($dataContent !== false && $dataContent !== '') {
+                        // Downscale & recompress for speed / size
+                        $optimized = optimize_image_jpeg($dataContent, 256, 80);
+                        $b64 = base64_encode($optimized);
+                        $dataUri = 'data:image/jpeg;base64,' . $b64;
+
+                        $entry['photos'][] = [
+                            'data_uri' => $dataUri,
+                            'mime'     => 'image/jpeg',
+                            'phone'    => $data['canonical'],
+                        ];
+                    }
+                }
+            } else {
+                $entry['error'] = 'User not found, not on Telegram, or not visible for this account';
+            }
+
+            $batchResults[$globalIdx] = $entry;
         } catch (Throwable $e) {
-            $batchResults[$globalIdx] = [
-                'phone'   => $batchData[$globalIdx]['phone'] ?? 'unknown',
-                'user'    => null,
-                'photos'  => [],
-                'error'   => $e->getMessage(),
-            ];
+            $entry['error'] = $e->getMessage();
+            $batchResults[$globalIdx] = $entry;
         }
     }
 
-    // Sort results by original index
+    // Sort results by original index and return
     ksort($batchResults);
     return array_values($batchResults);
-}
-
-/**
- * Lookup user photos for a single user
- */
-function lookupUserPhotos(API $MadelineProto, array $data): array {
-    $entry = [
-        'phone'   => $data['phone'],
-        'user'    => null,
-        'photos'  => [],
-        'error'   => null,
-    ];
-
-    try {
-        // Basic user info
-        $entry['user'] = [
-            'id'         => $data['userRaw']['id']         ?? null,
-            'username'   => $data['userRaw']['username']   ?? null,
-            'first_name' => $data['userRaw']['first_name'] ?? null,
-            'last_name'  => $data['userRaw']['last_name']  ?? null,
-            'phone'      => $data['userRaw']['phone']      ?? null,
-            'bot'        => $data['userRaw']['bot']        ?? false,
-        ];
-
-        // Fetch only the first profile photo for speed
-        $photosRes = $MadelineProto->photos->getUserPhotos([
-            'user_id' => $data['userId'],
-            'offset'  => 0,
-            'max_id'  => 0,
-            'limit'   => 1,
-        ]);
-
-        if (empty($photosRes['photos'])) {
-            return $entry;
-        }
-
-        $photo = $photosRes['photos'][0];
-
-        // Download to a temporary file
-        $tmpFile = tempnam(sys_get_temp_dir(), 'tg_');
-        $MadelineProto->downloadToFile($photo, $tmpFile);
-
-        $dataContent = file_get_contents($tmpFile);
-        @unlink($tmpFile);
-
-        if ($dataContent === false || $dataContent === '') {
-            return $entry;
-        }
-
-        // Downscale & recompress for speed / size
-        $optimized = optimize_image_jpeg($dataContent, 256, 80);
-
-        $b64 = base64_encode($optimized);
-        $dataUri = 'data:image/jpeg;base64,' . $b64;
-
-        $entry['photos'][] = [
-            'data_uri' => $dataUri,
-            'mime'     => 'image/jpeg',
-            'phone'    => $data['phone'],
-        ];
-
-        return $entry;
-    } catch (Throwable $e) {
-        $entry['error'] = $e->getMessage();
-        return $entry;
-    }
 }
